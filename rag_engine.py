@@ -2,14 +2,12 @@ from embedder import get_embedding
 from vectorstore import search_similar
 import google.generativeai as genai
 import requests
-from generate_care_plan import generate_care_plan
 from predict_specialty import predict_specialty
 from db_session import append_session
 from symptom_normalizer import normalize_symptom
 import re
 import json
 
-# Cấu hình API Gemini
 genai.configure(api_key="AIzaSyC8hGg01YBuaiyQ9FV73CUU_LFmLI7HdMU")
 
 def call_gemini_flash(prompt: str) -> str:
@@ -24,7 +22,7 @@ def classify_user_intent(question: str) -> str:
     - "personal_info": nếu người dùng hỏi về bản thân (tên, tuổi, lịch khám, bác sĩ từng gặp...)
     - "general_chat": nếu chỉ chào hỏi, hỏi vu vơ
 
-    Chỉ trả về đúng một từ: health_query, personal_info hoặc general_chat
+    Trả về đúng một từ: health_query, personal_info hoặc general_chat
 
     Câu hỏi: "{question}"
     """
@@ -48,18 +46,16 @@ def refine_question_if_needed(question: str) -> str:
 
 def extract_symptoms_with_gemini(question: str) -> list:
     prompt = f'''
-Bạn là bác sĩ. Trích xuất tất cả triệu chứng y tế có thể có từ câu hỏi sau. Trả lời **chỉ dưới dạng danh sách JSON tiếng Anh hợp lệ**, không giải thích, không dùng markdown:
+Bạn là bác sĩ. Trích xuất tất cả triệu chứng y tế có thể có từ câu hỏi sau. Trả lời dưới dạng JSON list tiếng Anh hợp lệ, không giải thích:
 "{question}"
-
-Ví dụ đầu ra: ["headache", "chest pain"]
+Ví dụ: ["headache", "chest pain"]
 '''
     try:
         model = genai.GenerativeModel("models/gemini-2.0-flash")
         response = model.generate_content(prompt)
         text = response.text.strip()
         if text.startswith("```"):
-            text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-            text = text.replace("```", "").strip()
+            text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip().replace("```", "").strip()
         if not text.startswith("[") or not text.endswith("]"):
             return []
         symptoms = json.loads(text)
@@ -110,11 +106,10 @@ def find_related_diseases(user_symptoms, diseases, min_match=3):
 
 def generate_answer(question: str, user_id: str) -> str:
     question = refine_question_if_needed(question)
-    question_lower = question.lower()
     intent = classify_user_intent(question)
 
-    # Trường hợp hội thoại hoặc yêu cầu cá nhân
-    if intent in ["personal_info", "general_chat"]:
+    # Xử lý hội thoại và thông tin cá nhân
+    if intent in ["general_chat", "personal_info"]:
         try:
             res = requests.get(f"http://localhost:3000/api/external/analyze/{user_id}", timeout=5)
             res.raise_for_status()
@@ -137,15 +132,14 @@ def generate_answer(question: str, user_id: str) -> str:
                 f"Huyết áp: {bp}. Xét nghiệm gần nhất: {lab}."
             )
 
-    # Nếu là health_query → tiếp tục quy trình chẩn đoán bệnh như cũ
+    # Xử lý health_query
     raw_symptoms_en = extract_symptoms_with_gemini(question)
     user_symptoms = [normalize_symptom(s) for s in raw_symptoms_en]
     standard_symptoms = get_standard_symptoms()
     user_symptoms = [s for s in user_symptoms if s in standard_symptoms]
 
     if user_symptoms:
-        normalized_query = f"Symptoms: {', '.join(user_symptoms)}. What is the possible disease?"
-        query_vec = get_embedding(normalized_query)
+        query_vec = get_embedding(f"Symptoms: {', '.join(user_symptoms)}")
     else:
         query_vec = get_embedding(question)
 
@@ -154,7 +148,7 @@ def generate_answer(question: str, user_id: str) -> str:
 
     docs = search_similar(query_vec)
     if not docs:
-        return "Hiện tại hệ thống không tìm thấy tài liệu liên quan để tư vấn. Vui lòng mô tả rõ hơn hoặc thử lại sau."
+        return "Chưa có tài liệu phù hợp. Bạn có thể mô tả rõ hơn?"
 
     try:
         res = requests.get(f"http://localhost:3000/api/external/analyze/{user_id}", timeout=5)
@@ -164,7 +158,6 @@ def generate_answer(question: str, user_id: str) -> str:
         data = {}
 
     patient_context = data.get("summary_text", "Không có dữ liệu bệnh nhân.")
-    abnormal_flags = data.get("abnormal_flags", [])
     active_doctors = data.get("active_doctors", [])
 
     predicted_specialty = predict_specialty(question)
@@ -186,42 +179,54 @@ def generate_answer(question: str, user_id: str) -> str:
         f"- {d['name']}: {d['desc']}" for d in related_diseases[:2]
     ]) or "Chưa xác định rõ"
 
+    # ❗ Nếu chưa có bệnh phù hợp → hỏi thêm triệu chứng
+    if not likely_disease:
+        followup_question = """
+Mình chưa đủ thông tin để tư vấn chính xác. Bạn có thể giúp mình trả lời thêm nhé:
+- Bạn cảm thấy không khỏe ở đâu (ví dụ: đầu, bụng, lưng...)?
+- Triệu chứng xuất hiện từ khi nào?
+- Mức độ: nhẹ, vừa hay dữ dội?
+
+Trả lời thêm giúp mình nhé
+"""
+        append_session(user_id, question, followup_question.strip())
+        return followup_question.strip()
+
+    # 🔥 Tạo prompt đẹp mắt và rõ ràng
     prompt = f"""
-Bạn là một bác sĩ gia đình ảo, nhiệm vụ của bạn là:
-1. Phân tích triệu chứng người bệnh cung cấp
-2. Đưa ra một số bệnh lý có thể liên quan
-3. Dự đoán chuyên khoa nên đến khám
-4. Đưa ra khuyến nghị: nên đi khám sớm hay theo dõi thêm
-5. Giữ ngữ điệu nhẹ nhàng, đồng cảm, dễ hiểu
+🩺 Bạn là một **bác sĩ gia đình ảo**. Phân tích thông tin bên dưới và đưa ra phản hồi:
 
-Ngữ cảnh bệnh nhân:
+🎯 **Yêu cầu**: 
+- Nhận định nguyên nhân có thể dựa trên triệu chứng
+- Gợi ý chuyên khoa phù hợp
+- Viết tự nhiên, nhẹ nhàng, không khẳng định chắc chắn
+- Không liệt kê máy móc
 
-📨 Câu hỏi:
-"{question}"
-📋 Triệu chứng trích xuất:
-{', '.join(user_symptoms) if user_symptoms else 'Chưa rõ'}
-📌 Bệnh nghi ngờ: {likely_disease['name'] if likely_disease else 'Chưa xác định'}
-🧠 Các bệnh có thể liên quan:
-{disease_summary_details}
-📈 Chuyên khoa phù hợp: {predicted_specialty}
-🔎 Dấu hiệu bất thường (nếu có):
-{'; '.join(abnormal_flags) if abnormal_flags else 'Không có'}
-👨‍⚕️ Bác sĩ sẵn có:
-{doctor_list}
-💼 Hồ sơ bệnh nhân:
-{patient_context}
-🎯 Hãy trả lời bệnh nhân bằng văn phong tự nhiên. Viết ngắn gọn, không quá 4–5 câu. Tránh liệt kê máy móc, không khẳng định chẩn đoán chắc chắn. Hãy hỗ trợ bệnh nhân ra quyết định.
+---
+
+📨 **Câu hỏi**: {question.strip()}
+
+📋 **Triệu chứng**: {', '.join(user_symptoms) or 'Chưa rõ'}
+
+📌 **Bệnh nghi ngờ**: {likely_disease['name'] if likely_disease else 'Chưa rõ'}
+
+🧠 **Bệnh có thể liên quan**:
+{disease_summary_details.strip()}
+
+📈 **Chuyên khoa phù hợp**: {predicted_specialty or 'Chưa rõ'}
+
+👨‍⚕️ **Bác sĩ gợi ý**:
+{doctor_list.strip()}
+
+---
+
+📢 **Viết ngắn gọn (dưới 5 câu), không dùng dấu * trong câu trả lời.**
 """
 
     try:
         llm_answer = call_gemini_flash(prompt)
     except Exception:
-        llm_answer = "Hiện tại hệ thống chưa thể tạo phản hồi chi tiết. Dưới đây là tư vấn sơ bộ."
+        llm_answer = "Hiện tại hệ thống chưa thể tạo phản hồi chi tiết. Vui lòng thử lại sau."
 
-    abnormal_section = "\n🔹 Dấu hiệu bất thường:\n- " + "\n- ".join(abnormal_flags) if abnormal_flags else ""
-    care_plan = generate_care_plan(user_id) if any(kw in question_lower for kw in ["tôi", "của tôi"]) and abnormal_flags else ""
-    care_plan_section = f"\n\n📋 Kế hoạch chăm sóc cá nhân hóa:\n{care_plan.strip()}" if care_plan else ""
-
-    final_answer = llm_answer + abnormal_section + care_plan_section
-    append_session(user_id, question, final_answer)
-    return final_answer
+    append_session(user_id, question, llm_answer)
+    return llm_answer
